@@ -1,0 +1,1 @@
+# sidetoc.koplugin
