@@ -1,6 +1,6 @@
 SideTOC | KOReader 侧边栏插件使用文档
 # SideTOC
-SideTOC 是一款轻量、墨水屏友好的 KOReader 侧边栏增强插件，集成目录导航、书签管理、字体快速切换三大常用功能。
+SideTOC 是一款轻量、墨水屏友好的 KOReader 侧边栏增强插件，集成目录导航、书签管理、字体快速切换，配置文件读取四个常用功能。
 
 ---
 一个为 KOReader 开发的侧边栏插件。
