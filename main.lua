@@ -1,10 +1,9 @@
 local Button = require("ui/widget/button")
 local ButtonDialog = require("ui/widget/buttondialog")
-local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
 local Event = require("ui/event")
-local FontList = require("fontlist")
+local BD = require("ui/bidi")
 local ffiUtil = require("ffi/util")
 local Geom = require("ui/geometry")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
@@ -37,6 +36,7 @@ local SideToc = WidgetContainer:extend{
     mode = "toc",
     expanded_toc = nil,
     toggle_width = nil,
+    toggle_hit_width = nil,
     position = "left",
     txt_toc = nil,
 }
@@ -135,6 +135,22 @@ function SideToc:_goto(item)
     end
 end
 
+function SideToc:_applyNativeFontPreview()
+    if not self.menu or self.mode ~= "fonts" then return end
+    if not self.menu.item_group then return end
+
+    for _, menu_item in ipairs(self.menu.item_group) do
+        local entry = menu_item.entry
+        local font_path = entry and entry.font
+        if font_path and menu_item.font ~= font_path then
+            menu_item.font = font_path
+            -- Reinitialize KOReader's existing native MenuItem so its
+            -- normal Font:getFace/TextWidget path uses this font.
+            menu_item:init()
+        end
+    end
+end
+
 function SideToc:_selectFont(item)
     if not item.font_face or not self.ui.font then return end
     if item.font_callback then
@@ -144,6 +160,7 @@ function SideToc:_selectFont(item)
     end
     if self.menu and self.mode == "fonts" then
         self.menu:switchItemTable(nil, self:_buildFontItems())
+        self:_applyNativeFontPreview()
         UIManager:setDirty(self.menu_container, "ui")
     end
 end
@@ -186,11 +203,43 @@ function SideToc:_buildBookmarkItems()
     return items
 end
 
+function SideToc:_buildProfileItems()
+    local items = {}
+    local profiles = self.ui.profiles
+    if not profiles or not profiles.data then return items end
+    local native_profiles = profiles:getSubMenuItems()
+    for name in ffiUtil.orderedPairs(profiles.data) do
+        local native_profile
+        for _, candidate in ipairs(native_profiles) do
+            if candidate.name == name then
+                native_profile = candidate
+                break
+            end
+        end
+        local native_actions = native_profile and native_profile.sub_item_table
+        local native_delete = native_actions and native_actions[#native_actions]
+        table.insert(items, {
+            text_func = function()
+                return profiles:getProfileMenuText(name)
+            end,
+            profile_callback = function()
+                self:_closeMenu()
+                profiles:onProfileExecute(name, { qm_show = false })
+            end,
+            profile_name = name,
+            profile_delete_callback = native_delete and native_delete.callback,
+        })
+    end
+    return items
+end
+
 function SideToc:_buildModeItems()
     if self.mode == "bookmarks" then
         return self:_buildBookmarkItems()
     elseif self.mode == "fonts" then
         return self:_buildFontItems()
+    elseif self.mode == "profiles" then
+        return self:_buildProfileItems()
     end
     return self:_buildItems()
 end
@@ -206,6 +255,7 @@ function SideToc:_switchMode(mode)
         self:_ensureCurrentTocParents(toc, self:_getCurrentTocIndex())
     end
     self.menu:switchItemTable(nil, self:_buildModeItems())
+    self:_applyNativeFontPreview()
     self:_updatePageControls()
     UIManager:setDirty(self.menu_container, "ui")
 end
@@ -215,39 +265,20 @@ function SideToc:_isEpub()
     return path and path:lower():match("%.epub$") ~= nil
 end
 
-function SideToc:_fontPathKey(path)
-    path = ffiUtil.realpath(path) or path
-    path = path:gsub("\\\\", "/"):gsub("/$", "")
-    return path:lower()
-end
-
-function SideToc:_getAllowedFontPaths()
-    FontList:getFontList()
-    local builtin_dir = self:_fontPathKey(FontList.fontdir)
-    local allowed_paths = {}
-    for _, path in ipairs(FontList.fontlist) do
-        local normalized_path = self:_fontPathKey(path)
-        local parent = normalized_path:match("^(.*)/[^/]+$")
-        if parent == builtin_dir then
-            allowed_paths[normalized_path] = true
-        end
-    end
-    return allowed_paths
-end
-
 function SideToc:_buildFontItems()
     local items = {}
     if not self.ui.font then return items end
 
     self.ui.font:setupFaceMenuTable()
-    local allowed_font_paths = self:_getAllowedFontPaths()
     local cre = require("document/credocument"):engineInit()
     for _, native_item in ipairs(self.ui.font.face_table or {}) do
         if native_item.menu_item_id then
             local font_path = cre.getFontFaceFilenameAndFaceIndex(native_item.menu_item_id)
-            if font_path and allowed_font_paths[self:_fontPathKey(font_path)] then
+            if font_path then
                 table.insert(items, {
+                    text = native_item.text_func and native_item.text_func() or "",
                     text_func = native_item.text_func,
+                    font = font_path,
                     bold = native_item.menu_item_id == self.ui.font.font_face,
                     font_face = native_item.menu_item_id,
                     font_callback = native_item.callback,
@@ -502,6 +533,64 @@ function SideToc:_refreshBookmarks()
     UIManager:setDirty(self.menu_container, "ui")
 end
 
+function SideToc:_refreshProfiles()
+    if not self.menu or self.mode ~= "profiles" then return end
+    self.menu:switchItemTable(nil, self:_buildProfileItems(), -1)
+    self:_updatePageControls()
+    UIManager:setDirty(self.menu_container, "ui")
+end
+
+function SideToc:_showProfileSave()
+    local profiles = self.ui.profiles
+    if not profiles then return true end
+    profiles:editProfileName(function(name)
+        profiles.data[name] = profiles:getProfileFromCurrentBookSettings(name)
+        profiles.updated = true
+        self:_refreshProfiles()
+    end)
+    return true
+end
+
+function SideToc:_showProfileActions(item)
+    local actions
+    actions = ButtonDialog:new{
+        buttons = {
+            {
+                {
+                    text = _("删除配置"),
+                    callback = function()
+                        UIManager:close(actions)
+                        local profiles = self.ui.profiles
+                        local name = item.profile_name
+                        local profile = profiles and profiles.data and profiles.data[name]
+                        if profiles and profile and name then
+                            -- Match KOReader's native profile deletion behavior,
+                            -- but skip its confirmation dialog.
+                            profiles:updateAutoExec(name)
+                            if profile.settings and profile.settings.registered then
+                                Dispatcher:removeAction(profiles.prefix .. name)
+                                UIManager:broadcastEvent(Event:new("DispatcherActionNameChanged",
+                                    { old_name = profiles.prefix .. name, new_name = nil }))
+                            end
+                            profiles.data[name] = nil
+                            profiles.updated = true
+                            self:_refreshProfiles()
+                        end
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("取消"),
+                    callback = function() UIManager:close(actions) end,
+                },
+            },
+        },
+    }
+    UIManager:show(actions)
+    return true
+end
+
 function SideToc:_showBookmarkActions(item)
     local bookmark = self.ui.bookmark
     local actions
@@ -512,14 +601,8 @@ function SideToc:_showBookmarkActions(item)
                     text = _("删除书签"),
                     callback = function()
                         UIManager:close(actions)
-                        UIManager:show(ConfirmBox:new{
-                            text = _("删除此书签？"),
-                            ok_text = _("删除"),
-                            ok_callback = function()
-                                bookmark:removeItem(item, item.bookmark_index)
-                                self:_refreshBookmarks()
-                            end,
-                        })
+                        bookmark:removeItem(item, item.bookmark_index)
+                        self:_refreshBookmarks()
                     end,
                 },
             },
@@ -537,10 +620,26 @@ end
 
 function SideToc:_updatePageControls()
     if not self.menu or not self.page_label then return end
-    self.page_label:setText(T(_("%1 / %2"), self.menu.page, self.menu.page_num), self.page_label.width)
-    self.page_label:enable()
+    self.menu[1][1][3][1] = self.mode == "profiles" and self.profile_footer or self.menu.page_info
+    if self.mode == "profiles" then
+        self.page_label:setText("", self.page_label.width)
+        self.page_label:disable()
+    else
+        self.page_label:setText(T(_("%1 / %2"), self.menu.page, self.menu.page_num), self.page_label.width)
+        self.page_label:enable()
+    end
     self.menu._side_previous:enableDisable(self.menu.page > 1)
     self.menu._side_next:enableDisable(self.menu.page < self.menu.page_num)
+end
+
+function SideToc:_getPanelRefreshRegion()
+    local screen_size = Screen:getSize()
+    return Geom:new{
+        x = self.position == "right" and screen_size.w - self.panel_width or 0,
+        y = 0,
+        w = self.panel_width,
+        h = screen_size.h,
+    }
 end
 
 function SideToc:_showPageJump()
@@ -575,10 +674,10 @@ function SideToc:_showPageJump()
 end
 
 function SideToc:_makePageControls(width)
-    local button_width = Screen:scaleBySize(36)
+    local button_width = Screen:scaleBySize(52)
     local gap = Screen:scaleBySize(4)
     local label_width = math.max(button_width, width - 2 * button_width - 2 * gap)
-    local button_height = Screen:scaleBySize(36)
+    local button_height = Screen:scaleBySize(48)
     local previous = Button:new{
         text = "‹",
         width = button_width,
@@ -586,6 +685,7 @@ function SideToc:_makePageControls(width)
         padding = 0,
         bordersize = 0,
         text_font_bold = true,
+        text_font_size = 24,
         callback = function()
             if self.menu.page > 1 then
                 self.menu:onGotoPage(self.menu.page - 1)
@@ -611,6 +711,7 @@ function SideToc:_makePageControls(width)
         padding = 0,
         bordersize = 0,
         text_font_bold = true,
+        text_font_size = 24,
         callback = function()
             if self.menu.page < self.menu.page_num then
                 self.menu:onGotoPage(self.menu.page + 1)
@@ -630,12 +731,15 @@ function SideToc:_makePageControls(width)
     self.menu._side_previous = previous
     self.menu._side_next = next_page
     self.page_label = label
+    self.page_gap = gap
+    self.page_button_height = button_height
     return controls
 end
 
 function SideToc:_makeHeader(width, height)
     local close_width = Screen:scaleBySize(36)
-    local tab_count = self:_isEpub() and 3 or 2
+    local has_font_tab = self:_isEpub()
+    local tab_count = has_font_tab and 4 or 3
     local tab_width = math.max(Screen:scaleBySize(36), math.floor((width - close_width) / tab_count))
     local header = {
         Button:new{
@@ -657,7 +761,7 @@ function SideToc:_makeHeader(width, height)
             callback = function() self:_switchMode("bookmarks") end,
         },
     }
-    if tab_count == 3 then
+    if has_font_tab then
         table.insert(header, Button:new{
             text = _("字体"),
             width = tab_width,
@@ -668,6 +772,15 @@ function SideToc:_makeHeader(width, height)
             callback = function() self:_switchMode("fonts") end,
         })
     end
+    table.insert(header, Button:new{
+        text = _("配置"),
+        width = tab_width,
+        height = height,
+        padding = 0,
+        bordersize = 0,
+        text_font_bold = self.mode == "profiles",
+        callback = function() self:_switchMode("profiles") end,
+    })
     table.insert(header, Button:new{
         text = "×",
         width = close_width,
@@ -682,6 +795,22 @@ end
 
 function SideToc:_installPageControls()
     local controls = self:_makePageControls(self.panel_width)
+    self.profile_save_button = Button:new{
+        text = "＋",
+        width = self.page_label.width,
+        height = self.page_button_height,
+        padding = 0,
+        bordersize = 0,
+        text_font_bold = true,
+        callback = function() self:_showProfileSave() end,
+    }
+    self.profile_footer = HorizontalGroup:new{
+        self.menu._side_previous,
+        HorizontalSpan:new{ width = self.page_gap },
+        self.profile_save_button,
+        HorizontalSpan:new{ width = self.page_gap },
+        self.menu._side_next,
+    }
     self.menu.page_info = controls
     self.menu[1][1][3][1] = controls
     self:_updatePageControls()
@@ -692,6 +821,7 @@ function SideToc:_showMenu()
     self.position = self:_getPanelPosition()
     self.panel_width = math.floor(Screen:getWidth() * 0.47)
     self.toggle_width = Screen:scaleBySize(24)
+    self.toggle_hit_width = Screen:scaleBySize(40)
     local toc = self:_initNativeToc()
     self:_ensureCurrentTocParents(toc, self:_getCurrentTocIndex())
     local items = self:_buildModeItems()
@@ -711,8 +841,22 @@ function SideToc:_showMenu()
     self.menu.owner = self
     function self.menu:onGotoPage(page)
         Menu.onGotoPage(self, page)
+        self.owner:_applyNativeFontPreview()
         self.owner:_updatePageControls()
-        UIManager:setDirty(self.owner.menu_container, "ui")
+        if self.owner.menu_container then
+            UIManager:setDirty(self.owner.menu_container, function()
+                return "ui", self.owner:_getPanelRefreshRegion()
+            end)
+        end
+        return true
+    end
+    function self.menu:onSwipe(arg, ges_ev)
+        local direction = BD.flipDirectionIfMirroredUILayout(ges_ev.direction)
+        if direction == "west" or direction == "north" then
+            self:onNextPage()
+        elseif direction == "east" or direction == "south" then
+            self:onPrevPage()
+        end
         return true
     end
     function self.menu:onPrevPage()
@@ -729,12 +873,18 @@ function SideToc:_showMenu()
     end
     function self.menu:onMenuSelect(item, pos)
         if self.owner.mode == "toc" and item.has_children and pos and pos.x
-                and pos.x < self.owner.toggle_width / self.owner.panel_width then
+                and pos.x < self.owner.toggle_hit_width / self.owner.panel_width then
             self.owner:_toggleTocNode(item.toc_index)
             return true
         end
         if self.owner.mode == "fonts" then
             self.owner:_selectFont(item)
+            return true
+        end
+        if self.owner.mode == "profiles" then
+            if item.profile_callback then
+                item.profile_callback()
+            end
             return true
         end
         self.owner:_goto(item)
@@ -743,6 +893,9 @@ function SideToc:_showMenu()
     function self.menu:onMenuHold(item)
         if self.owner.mode == "bookmarks" then
             return self.owner:_showBookmarkActions(item)
+        end
+        if self.owner.mode == "profiles" then
+            return self.owner:_showProfileActions(item)
         end
         return true
     end
@@ -759,10 +912,11 @@ function SideToc:_showMenu()
     local PanelContainer = self.position == "right" and RightContainer or LeftContainer
     local right_border = LineWidget:new{
         dimen = Geom:new{ x = 0, y = 0, w = 1, h = screen_size.h },
+        style = "solid",
         background = Blitbuffer.COLOR_BLACK,
     }
     if self.position == "right" then
-        right_border.overlap_align = "right"
+        right_border.overlap_offset = { screen_size.w - self.panel_width, 0 }
     else
         right_border.overlap_offset = { self.panel_width - 1, 0 }
     end
